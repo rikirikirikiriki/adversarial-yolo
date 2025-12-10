@@ -152,6 +152,8 @@ class MyVisDroneConfig(BaseConfig):
         self.class_names = ["pedestrian","people","bicycle","car","van",
                              "truck","tricycle","awning-tricycle","bus","motor"]  # VisDrone类别名称列表
         self.target_class = -1      # 攻击目标类别ID；-1表示不固定特定类别（对所有类别目标通用）
+        # VisDrone 场景目标密集，保持较小的 max_lab 可避免在 PatchTransformer 中为过多目标复制 patch 造成显存溢出。
+        self.max_lab = 40
         self.max_epoch = 1
         self.print_interval = 10    # 日志打印间隔（每多少个iteration输出一次loss）
         self.save_interval = 50     # Patch保存间隔（每多少epoch保存一次当前贴纸图像）
