@@ -18,7 +18,7 @@ class BaseConfig(object):
         self.patch_size = 300
         self.image_size = 640
         self.max_epoch = 1
-        self.max_lab = 200
+        self.max_lab = 40
 
         self.start_learning_rate = 0.03
 
