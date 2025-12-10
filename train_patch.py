@@ -42,7 +42,8 @@ class PatchTrainer(object):
         self.model_path = Path(self.config.weightfile)
         self.darknet_model = YOLO(self.model_path)  # 通过 YOLO 类替代 Darknet(cfg+weights) 的旧加载方式
         # ultralytics.YOLO 不是 nn.Module；实际的可训练网络位于 .model，下行确保网络驻留在 GPU 并冻结参数避免不必要的显存开销。
-        self.darknet_model.model.to(self.device).eval().requires_grad_(False)
+        # 为了让梯度能回传到补丁（而不是模型参数），保持模型在 train() 状态但仍冻结权重，避免推理路径里的 no_grad 包裹导致梯度中断。
+        self.darknet_model.model.to(self.device).train().requires_grad_(False)
         self.scaler = GradScaler(enabled=torch.cuda.is_available())
         self.target_cls = getattr(self.config, 'target_cls', 0)
         raw_imgsz = getattr(self.darknet_model.model, 'args', None)
@@ -161,77 +162,123 @@ class PatchTrainer(object):
                         img = transforms.ToPILImage()(img.detach().cpu())
                         #img.show()
 
-
+                    # YOLOv11 在半精度下 head 的 Sigmoid 反向偶发 NaN，
+                    # 这里强制用全精度执行模型前向，避免 AMP 导致的溢出。p_img_batch 保持 fp32 以匹配。
+                    p_img_batch = p_img_batch.float()
+                    with autocast(enabled=False):
                         output = self.darknet_model.model(p_img_batch)
+                        # YOLO() 默认 forward 会走 predict 路径并触发后处理/NMS，梯度会在此被截断，导致补丁无法更新。
+                        # 这里优先调用底层 model.model（纯 nn.ModuleList）得到原始预测张量；若版本差异导致调用失败，再退回常规 forward。
+                        try:
+                            output = self.darknet_model.model.model(p_img_batch)
+                        except Exception:
+                            output = self.darknet_model.model(p_img_batch)
 
                         # YOLOv11 混合精度下偶发 NaN/Inf，若预测包含非有限值则跳过本 batch，避免 SigmoidBackward 报错。
-                        def _get_output_tensor(raw_out):
-                            if isinstance(raw_out, torch.Tensor):
-                                return raw_out
-                            if isinstance(raw_out, (list, tuple)) and len(raw_out) > 0:
-                                first = raw_out[0]
-                                if isinstance(first, torch.Tensor):
-                                    return first
-                                if hasattr(first, 'boxes') and hasattr(first.boxes, 'data'):
-                                    return first.boxes.data
-                            return None
+                    def _get_output_tensor(raw_out):
+                        if isinstance(raw_out, torch.Tensor):
+                            return raw_out
+                        if isinstance(raw_out, (list, tuple)) and len(raw_out) > 0:
+                            first = raw_out[0]
+                            if isinstance(first, torch.Tensor):
+                                return first
+                            if hasattr(first, 'boxes') and hasattr(first.boxes, 'data'):
+                                return first.boxes.data
+                        return None
 
-                        out_tensor = _get_output_tensor(output)
-                        if out_tensor is not None and not torch.isfinite(out_tensor).all():
-                            print(f"[warn] skip batch {i_batch} due to non-finite model output")
-                            optimizer.zero_grad(set_to_none=True)
-                            del adv_batch_t, output, p_img_batch
-                            torch.cuda.empty_cache()
-                            continue
-                            #max_prob = self.prob_extractor(output)
+                    out_tensor = _get_output_tensor(output)
+                    if out_tensor is not None and not torch.isfinite(out_tensor).all():
+                        print(f"[warn] skip batch {i_batch} due to non-finite model output")
+                        optimizer.zero_grad(set_to_none=True)
+                        del adv_batch_t, output, p_img_batch
+                        torch.cuda.empty_cache()
+                        continue
+                        #     #max_prob = self.prob_extractor(output)
 
-                        results = None
-                        if isinstance(output, list) and len(output) > 0 and hasattr(output[0], 'boxes'):
-                            results = output
-                        elif hasattr(output, 'boxes'):
-                            results = [output]
+                        # results = None
+                        # if isinstance(output, list) and len(output) > 0 and hasattr(output[0], 'boxes'):
+                        #     results = output
+                        # elif hasattr(output, 'boxes'):
+                        #     results = [output]
 
-                        if results is not None:
-                            boxes = results[0].boxes
-                            obj_scores = boxes.conf.to(p_img_batch.device)
-                            probs = getattr(results[0], 'probs', None)
+                        # if results is not None:
+                        #     boxes = results[0].boxes
+                        #     obj_scores = boxes.conf.to(p_img_batch.device)
+                        #     probs = getattr(results[0], 'probs', None)
 
-                            if probs is not None:
-                                cls_scores = probs.data.to(p_img_batch.device)
-                                combined_scores = self.config.loss_target(obj_scores.unsqueeze(-1), cls_scores)
-                                max_prob = combined_scores.max(dim=1).values
-                            else:
-                                # yolo11 输出格式变化：此处手动取 conf/cls 构造对抗损失
-                                max_cls_score = torch.ones_like(obj_scores)
-                                combined_scores = self.config.loss_target(obj_scores, max_cls_score)
-                                max_prob = combined_scores
+                        #     if probs is not None:
+                        #         cls_scores = probs.data.to(p_img_batch.device)
+                        #         combined_scores = self.config.loss_target(obj_scores.unsqueeze(-1), cls_scores)
+                        #         max_prob = combined_scores.max(dim=1).values
+                        #     else:
+                        #         # yolo11 输出格式变化：此处手动取 conf/cls 构造对抗损失
+                        #         max_cls_score = torch.ones_like(obj_scores)
+                        #         combined_scores = self.config.loss_target(obj_scores, max_cls_score)
+                        #         max_prob = combined_scores
+                    results = None
+                    if isinstance(output, list) and len(output) > 0 and hasattr(output[0], 'boxes'):
+                        results = output
+                    elif hasattr(output, 'boxes'):
+                        results = [output]
+
+                    if results is not None:
+                        boxes = results[0].boxes
+                        obj_scores = boxes.conf.to(p_img_batch.device)
+                        probs = getattr(results[0], 'probs', None)
+
+                        if probs is not None:
+                            cls_scores = probs.data.to(p_img_batch.device)
+                            combined_scores = self.config.loss_target(obj_scores.unsqueeze(-1), cls_scores)
+                            max_prob = combined_scores.max(dim=1).values
                         else:
-                    #         # yolo11 输出格式变化：此处手动取 conf/cls 构造对抗损失
-                    #         max_cls_score = torch.ones_like(obj_scores)
-                    #         combined_scores = self.config.loss_target(obj_scores, max_cls_score)
-                    #         max_prob = combined_scores
-                    # else:
-                    #     max_prob = self.prob_extractor(output)
-                            # 当 YOLOv11 前向仅返回原始预测张量（而非 Results 对象）时，直接从输出张量中取 obj 与 cls 打分，避免旧版 prob_extractor 依赖。
-                            raw_preds = output[0] if isinstance(output, (list, tuple)) else output
-                            if isinstance(raw_preds, torch.Tensor):
-                                obj_scores = raw_preds[..., 4]
-                                cls_scores = raw_preds[..., 5:] if raw_preds.shape[-1] > 5 else torch.ones_like(obj_scores).unsqueeze(-1)
-                                combined_scores = self.config.loss_target(obj_scores.unsqueeze(-1), cls_scores)
-                                max_prob = combined_scores.max(dim=-1).values
-                            else:
-                                raise RuntimeError(f"Unsupported YOLO output type: {type(raw_preds)}")
+                            # yolo11 输出格式变：此处手动取 conf/cls 构造对抗损失
+                            max_cls_score = torch.ones_like(obj_scores)
+                            combined_scores = self.config.loss_target(obj_scores, max_cls_score)
+                            max_prob = combined_scores
+                    else:
+                        # 当 YOLOv11 前向仅返回原始预测张量（而非 Results 对象）时，直接从输出张量中取 obj 与 cls 打分，避免旧版 prob_extractor 依赖。
+                        raw_preds = output[0] if isinstance(output, (list, tuple)) else output
+                        if isinstance(raw_preds, torch.Tensor):
+                            obj_scores = raw_preds[..., 4]
+                            cls_scores = raw_preds[..., 5:] if raw_preds.shape[-1] > 5 else torch.ones_like(obj_scores).unsqueeze(-1)
+                            combined_scores = self.config.loss_target(obj_scores.unsqueeze(-1), cls_scores)
+                            max_prob = combined_scores.max(dim=-1).values
+                        else:
+                            raise RuntimeError(f"Unsupported YOLO output type: {type(raw_preds)}")
 
-                        nps = self.nps_calculator(adv_patch)
-                        tv = self.total_variation(adv_patch)
+                    # #         # yolo11 输出格式变化：此处手动取 conf/cls 构造对抗损失
+                    # #         max_cls_score = torch.ones_like(obj_scores)
+                    # #         combined_scores = self.config.loss_target(obj_scores, max_cls_score)
+                    # #         max_prob = combined_scores
+                    # # else:
+                    # #     max_prob = self.prob_extractor(output)
+                    #         # 当 YOLOv11 前向仅返回原始预测张量（而非 Results 对象）时，直接从输出张量中取 obj 与 cls 打分，避免旧版 prob_extractor 依赖。
+                    #         raw_preds = output[0] if isinstance(output, (list, tuple)) else output
+                    #         if isinstance(raw_preds, torch.Tensor):
+                    #             obj_scores = raw_preds[..., 4]
+                    #             cls_scores = raw_preds[..., 5:] if raw_preds.shape[-1] > 5 else torch.ones_like(obj_scores).unsqueeze(-1)
+                    #             combined_scores = self.config.loss_target(obj_scores.unsqueeze(-1), cls_scores)
+                    #             max_prob = combined_scores.max(dim=-1).values
+                    #         else:
+                    #             raise RuntimeError(f"Unsupported YOLO output type: {type(raw_preds)}")
+
+                    #     nps = self.nps_calculator(adv_patch)
+                    #     tv = self.total_variation(adv_patch)
 
 
-                        nps_loss = nps*0.01
-                        tv_loss = tv*2.5
-                        det_loss = torch.mean(max_prob)
-                        #loss = det_loss + nps_loss + torch.max(tv_loss, torch.tensor(0.1).cuda())
-                        loss = det_loss + nps_loss + torch.max(tv_loss, torch.tensor(0.1, device=self.device))
+                    #     nps_loss = nps*0.01
+                    #     tv_loss = tv*2.5
+                    #     det_loss = torch.mean(max_prob)
+                    #     #loss = det_loss + nps_loss + torch.max(tv_loss, torch.tensor(0.1).cuda())
+                    #     loss = det_loss + nps_loss + torch.max(tv_loss, torch.tensor(0.1, device=self.device))
+                    nps = self.nps_calculator(adv_patch)
+                    tv = self.total_variation(adv_patch)
 
+
+                    nps_loss = nps*0.01
+                    tv_loss = tv*2.5
+                    det_loss = torch.mean(max_prob)
+                    loss = det_loss + nps_loss + torch.max(tv_loss, torch.tensor(0.1, device=self.device))
                     # YOLOv11 的 head 在半精度下偶发 NaN（见 SigmoidBackward0 报错），若当前 batch 出现非有限值，
                     # 则跳过本 batch 以防训练中断，同时释放中间显存。
                     if not torch.isfinite(loss).all():
