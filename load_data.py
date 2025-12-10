@@ -412,7 +412,8 @@ class InriaDataset(Dataset):
                 padded_img.paste(img, (0, int(padding)))
                 lab[:, [2]] = (lab[:, [2]] * h + padding) / w
                 lab[:, [4]] = (lab[:, [4]] * h  / w)
-        resize = transforms.Resize((self.imgsize,self.imgsize))
+        #resize = transforms.Resize((self.imgsize,self.imgsize))
+        resize = transforms.Resize((self.imgsize, self.imgsize))  # 随配置读取，匹配 yolo11
         padded_img = resize(padded_img)     #choose here
         return padded_img, lab
 
@@ -420,6 +421,11 @@ class InriaDataset(Dataset):
         pad_size = self.max_n_labels - lab.shape[0]
         if(pad_size>0):
             padded_lab = F.pad(lab, (0, 0, 0, pad_size), value=1)
+        elif pad_size < 0:
+            # Limit the number of labels per image to max_n_labels to keep batch tensors aligned.
+            # Without this, DataLoader will raise a stacking error when some images contain
+            # many more objects than the configured cap (set via patch_config.max_lab).
+            padded_lab = lab[:self.max_n_labels]
         else:
             padded_lab = lab
         return padded_lab
@@ -434,7 +440,7 @@ if __name__ == '__main__':
         print('  python load_data.py img_dir lab_dir')
         sys.exit()
 
-    test_loader = torch.utils.data.DataLoader(InriaDataset(img_dir, lab_dir, shuffle=True),
+    test_loader = torch.utils.data.DataLoader(InriaDataset(img_dir, lab_dir, max_lab=200,shuffle=True),
                                               batch_size=3, shuffle=True)
 
     cfgfile = "cfg/yolov2.cfg"

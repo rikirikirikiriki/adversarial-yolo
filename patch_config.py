@@ -16,6 +16,9 @@ class BaseConfig(object):
         self.weightfile = "weights/yolo.weights"
         self.printfile = "non_printability/30values.txt"
         self.patch_size = 300
+        self.image_size = 640
+        self.max_epoch = 1
+        self.max_lab = 200
 
         self.start_learning_rate = 0.03
 
@@ -24,7 +27,7 @@ class BaseConfig(object):
         self.scheduler_factory = lambda x: optim.lr_scheduler.ReduceLROnPlateau(x, 'min', patience=50)
         self.max_tv = 0
 
-        self.batch_size = 20
+        self.batch_size = 2
 
         self.loss_target = lambda obj, cls: obj * cls
 
@@ -121,6 +124,37 @@ class ReproducePaperObj(BaseConfig):
 
         self.loss_target = lambda obj, cls: obj
 
+# 在patch_config.py末尾新增MyVisDroneConfig配置类，继承自BaseConfig
+class MyVisDroneConfig(BaseConfig):
+    """ 基于VisDrone数据集的对抗贴纸训练配置 """
+    def __init__(self):
+        super().__init__()  # 调用基类构造，设置默认参数
+        self.img_dir = "data/my-visdrone/images"
+        self.lab_dir = "data/my-visdrone/labels"
+    
+        self.weightfile = "weights/yolo11x-visdrone.pt"
+        #self.printfile = "non_printability/30values.txt"
+        self.patch_size = 300
+
+        self.start_learning_rate = 0.03
+
+        self.patch_name = 'my-visdrone'
+        self.max_tv = 0.165
+        self.image_size = 640
+        self.img_size=640
+
+        self.batch_size = 2
+
+        self.loss_target = lambda obj, cls: obj
+
+        #子类新增的属性
+        self.num_classes = 10                               # VisDrone数据集类别数（10类，与VisDrone官方一致）
+        self.class_names = ["pedestrian","people","bicycle","car","van",
+                             "truck","tricycle","awning-tricycle","bus","motor"]  # VisDrone类别名称列表
+        self.target_class = -1      # 攻击目标类别ID；-1表示不固定特定类别（对所有类别目标通用）
+        self.max_epoch = 1
+        self.print_interval = 10    # 日志打印间隔（每多少个iteration输出一次loss）
+        self.save_interval = 50     # Patch保存间隔（每多少epoch保存一次当前贴纸图像）
 
 patch_configs = {
     "base": BaseConfig,
@@ -129,5 +163,7 @@ patch_configs = {
     "exp2_high_res": Experiment2HighRes,
     "exp3_low_res": Experiment3LowRes,
     "exp4_class_only": Experiment4ClassOnly,
-    "paper_obj": ReproducePaperObj
+    "paper_obj": ReproducePaperObj,
+    "my-visdrone": MyVisDroneConfig
 }
+

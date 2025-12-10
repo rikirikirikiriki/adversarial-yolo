@@ -3,7 +3,12 @@ Training code for Adversarial patch training
 
 
 """
-
+import argparse
+import gc
+import subprocess
+import sys
+import time
+from pathlib import Path
 import PIL
 import load_data
 from tqdm import tqdm
@@ -14,22 +19,38 @@ import matplotlib.pyplot as plt
 from torch import autograd
 from torchvision import transforms
 from tensorboardX import SummaryWriter
-import subprocess
+
 
 import patch_config
-import sys
-import time
+
+import torch
+from ultralytics import YOLO
 
 class PatchTrainer(object):
     def __init__(self, mode):
         self.config = patch_config.patch_configs[mode]()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # self.darknet_model = Darknet(self.config.cfgfile)
+        # self.darknet_model.load_weights(self.config.weightfile)
+        # self.darknet_model = self.darknet_model.eval().cuda() # TODO: Why eval?
+        self.model_path = "weights/yolo11x-visdrone.pt"  # yolo11 使用单一 .pt 权重文件替代 cfg/weights 分离版本，不再需要独立配置路径
+        self.darknet_model = YOLO(self.model_path)  # yolo11 不再使用 Darknet load_weights
+        self.darknet_model = self.darknet_model.to('cuda').eval()
+        self.target_cls = getattr(self.config, 'target_cls', 0)
+        raw_imgsz = getattr(self.darknet_model.model, 'args', None)
+        if isinstance(raw_imgsz, dict):
+            imgsz = raw_imgsz.get('imgsz', 640)
+        else:
+            imgsz = getattr(raw_imgsz, 'imgsz', 640)
+        if isinstance(imgsz, (list, tuple)):
+            self.model_height = imgsz[0]
+            self.model_width = imgsz[1] if len(imgsz) > 1 else imgsz[0]
+        else:
+            self.model_height = self.model_width = imgsz
 
-        self.darknet_model = Darknet(self.config.cfgfile)
-        self.darknet_model.load_weights(self.config.weightfile)
-        self.darknet_model = self.darknet_model.eval().cuda() # TODO: Why eval?
         self.patch_applier = PatchApplier().cuda()
         self.patch_transformer = PatchTransformer().cuda()
-        self.prob_extractor = MaxProbExtractor(0, 80, self.config).cuda()
+        #self.prob_extractor = MaxProbExtractor(0, 80, self.config).cuda()
         self.nps_calculator = NPSCalculator(self.config.printfile, self.config.patch_size).cuda()
         self.total_variation = TotalVariation().cuda()
 
@@ -49,15 +70,19 @@ class PatchTrainer(object):
         :return: Nothing
         """
 
-        img_size = self.darknet_model.height
+        #img_size = self.darknet_model.height
+        img_size = self.config.img_size # 随配置读取，匹配 yolo11
+        img_size = self.model_height
         batch_size = self.config.batch_size
-        n_epochs = 10000
-        max_lab = 14
+        n_epochs = self.config.max_epoch
+        max_lab = 200
 
         time_str = time.strftime("%Y%m%d-%H%M%S")
+        save_dir = Path("saved_patches")
+        save_dir.mkdir(parents=True, exist_ok=True)
 
         # Generate stating point
-        adv_patch_cpu = self.generate_patch("gray")
+        adv_patch_cpu = self.generate_patch("gray").to(self.device)
         #adv_patch_cpu = self.read_image("saved_patches/patchnew0.jpg")
 
         adv_patch_cpu.requires_grad_(True)
@@ -89,7 +114,8 @@ class PatchTrainer(object):
                     adv_patch = adv_patch_cpu.cuda()
                     adv_batch_t = self.patch_transformer(adv_patch, lab_batch, img_size, do_rotate=True, rand_loc=False)
                     p_img_batch = self.patch_applier(img_batch, adv_batch_t)
-                    p_img_batch = F.interpolate(p_img_batch, (self.darknet_model.height, self.darknet_model.width))
+                    #p_img_batch = F.interpolate(p_img_batch, (self.darknet_model.height, self.darknet_model.width))
+                    p_img_batch = F.interpolate(p_img_batch, (img_size, img_size))                   
 
                     img = p_img_batch[1, :, :,]
                     img = transforms.ToPILImage()(img.detach().cpu())
@@ -97,7 +123,31 @@ class PatchTrainer(object):
 
 
                     output = self.darknet_model(p_img_batch)
-                    max_prob = self.prob_extractor(output)
+                    #max_prob = self.prob_extractor(output)
+
+                    results = None
+                    if isinstance(output, list) and len(output) > 0 and hasattr(output[0], 'boxes'):
+                        results = output
+                    elif hasattr(output, 'boxes'):
+                        results = [output]
+
+                    if results is not None:
+                        boxes = results[0].boxes
+                        obj_scores = boxes.conf.to(p_img_batch.device)
+                        probs = getattr(results[0], 'probs', None)
+
+                        if probs is not None:
+                            cls_scores = probs.data.to(p_img_batch.device)
+                            combined_scores = self.config.loss_target(obj_scores.unsqueeze(-1), cls_scores)
+                            max_prob = combined_scores.max(dim=1).values
+                        else:
+                            # yolo11 输出格式变化：此处手动取 conf/cls 构造对抗损失
+                            max_cls_score = torch.ones_like(obj_scores)
+                            combined_scores = self.config.loss_target(obj_scores, max_cls_score)
+                            max_prob = combined_scores
+                    else:
+                        max_prob = self.prob_extractor(output)
+
                     nps = self.nps_calculator(adv_patch)
                     tv = self.total_variation(adv_patch)
 
@@ -157,9 +207,37 @@ class PatchTrainer(object):
                 #plt.imshow(im)
                 #plt.show()
                 #im.save("saved_patches/patchnew1.jpg")
+                patch_image = transforms.ToPILImage('RGB')(adv_patch_cpu.detach().cpu())
+                patch_filename = f"{time_str}_{self.config.patch_name}_{epoch}.png"
+                patch_path = save_dir / patch_filename
+                patch_image.save(patch_path)
+                print(f"Saved patch to {patch_path}")
                 del adv_batch_t, output, max_prob, det_loss, p_img_batch, nps_loss, tv_loss, loss
                 torch.cuda.empty_cache()
             et0 = time.time()
+
+    
+    def extract_max_confidence(self, results):
+        if results is None or len(results) == 0:
+            return torch.tensor(0.0, device=next(self.darknet_model.model.parameters()).device)
+
+        result = results[0]
+        boxes = result.boxes
+        probs = result.probs
+
+        if boxes is None or boxes.data.numel() == 0:
+            return torch.tensor(0.0, device=next(self.darknet_model.model.parameters()).device)
+
+        confs = boxes.conf
+        cls_ids = boxes.cls
+
+        if probs is not None and hasattr(probs, 'shape') and probs.shape[0] == cls_ids.shape[0]:
+            target_scores = probs[:, int(self.target_cls)].to(confs.device)
+            confs = confs * target_scores
+
+        target_mask = cls_ids == self.target_cls
+        target_confs = confs[target_mask] if target_mask.any() else confs
+        return target_confs.max() if target_confs.numel() > 0 else torch.tensor(0.0, device=confs.device)
 
     def generate_patch(self, type):
         """
@@ -192,13 +270,18 @@ class PatchTrainer(object):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print('You need to supply (only) a configuration mode.')
-        print('Possible modes are:')
-        print(patch_config.patch_configs)
+    # if len(sys.argv) != 2:
+    #     print('You need to supply (only) a configuration mode.')
+    #     print('Possible modes are:')
+    #     print(patch_config.patch_configs)
+    parser = argparse.ArgumentParser(description='Train adversarial patches.')
+    parser.add_argument('--config', default='my_visdrone', choices=patch_config.patch_configs.keys(),
+                        help='Configuration key to use from patch_config.patch_configs')
+    args = parser.parse_args()
 
 
-    trainer = PatchTrainer(sys.argv[1])
+    #trainer = PatchTrainer(sys.argv[1])
+    trainer = PatchTrainer(args.config)
     trainer.train()
 
 if __name__ == '__main__':

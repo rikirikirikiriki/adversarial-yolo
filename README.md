@@ -42,3 +42,12 @@ You can generate this patch by running:
 ```
 python train_patch.py paper_obj
 ```
+
+# Training with a custom YOLO11-Visdrone model (white-box setup)
+After modifying `patch_config.py` and `train_patch.py` to load your Ultralytics YOLO11-Visdrone weights and my-visdrone dataset paths, start white-box patch training from the repository root with:
+
+```
+python train_patch.py --config my-visdrone
+```
+
+This picks up your updated model loader, dataset paths, and image size settings for the white-box experiment.
